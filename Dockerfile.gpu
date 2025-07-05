@@ -1,0 +1,68 @@
+###############################################################################
+# Spark 3.4.1  +  RAPIDS 25.06  +  CUDA 11.8  +  custom user “darth”
+###############################################################################
+FROM jupyter/pyspark-notebook:spark-3.4.1
+
+########################
+# 1. User / UID settings
+########################
+ARG NB_USER=darth          # ← your requested user name
+ARG NB_UID=1000              # ← and UID (matches host UID if you mount volumes)
+
+# These env-vars are parsed by docker-stacks’ start-up script
+ENV NB_USER=${NB_USER} \
+    NB_UID=${NB_UID} \
+    HOME=/home/${NB_USER}
+
+USER root                    # remain root while layering in software below
+
+########################
+# 2. CUDA runtime (+ OS deps)
+########################
+ARG CUDA_VER=11.8
+RUN wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+      | dpkg -i - && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends cuda-runtime-${CUDA_VER/-/.} && \
+    rm -rf /var/lib/apt/lists/*
+
+########################
+# 3. RAPIDS Python stack
+########################
+ARG RAPIDS_VER=25.06.0
+RUN conda install -y -c conda-forge mamba && \
+    mamba install -y -c rapidsai -c conda-forge \
+          rapids=${RAPIDS_VER%%.*}.* \
+          python=3.10 cudatoolkit=${CUDA_VER} && \
+    mamba clean -afy
+
+########################
+# 4. RAPIDS Accelerator + cuDF jars (Scala 2.12 build)
+########################
+ENV RAPIDS_JAR_URL=https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.12/${RAPIDS_VER}/rapids-4-spark_2.12-${RAPIDS_VER}.jar \
+    CUDF_JAR_URL=https://repo1.maven.org/maven2/ai/rapids/cudf/${RAPIDS_VER}/cudf-${RAPIDS_VER}-cuda11.jar
+RUN mkdir -p /opt/spark-rapids && \
+    wget -qO /opt/spark-rapids/rapids.jar ${RAPIDS_JAR_URL} && \
+    wget -qO /opt/spark-rapids/cudf.jar   ${CUDF_JAR_URL}
+
+########################
+# 5. Spark config (GPU plugin enabled)
+########################
+RUN mkdir -p /usr/local/spark/conf
+COPY spark-defaults.conf /usr/local/spark/conf/
+
+########################
+# 6. Optional GPU-discovery helper
+########################
+COPY getGpusResources.sh /usr/local/bin/getGpusResources.sh
+RUN chmod +x /usr/local/bin/getGpusResources.sh
+
+################################################################
+# 7. Fix permissions so $NB_USER can write to added directories
+################################################################
+RUN fix-permissions /opt/spark-rapids /usr/local/spark/conf
+
+########################
+# 8. Drop root → darth
+########################
+USER ${NB_UID}
