@@ -1,22 +1,7 @@
-"""
-pip install polars pyarrow zstandard
+# pip install polars pyarrow zstandard
 
-One-shot size reduction with POLARS (loads CSV once, ~128GB RAM available)
-
-What it does:
-- Read CSV once with Polars (fast, memory-efficient).
-- Drop mostly-missing and near-constant columns (configurable).
-- Downcast integers to the smallest safe width; cast floats -> Float32.
-- Convert low-cardinality strings to Categorical with rare values -> "OTHER".
-- Write a single ZSTD-compressed Parquet.
-
-Tune the CONFIG section for your dataset.
-"""
-
-from __future__ import annotations
 import os
 from typing import Dict, Iterable, Optional, Tuple
-
 import polars as pl
 
 # ====================== CONFIG ======================
@@ -47,14 +32,13 @@ def bytes_readable(num: int) -> str:
 
 def load_csv_once(path: str, usecols=None) -> pl.DataFrame:
     read_kwargs = dict(
-        infer_schema_length=10_000, # more robust inference
+        infer_schema_length=10_000,
         ignore_errors=True,
         try_parse_dates=True,
         rechunk=True,
     )
     if usecols is not None:
         read_kwargs["columns"] = list(usecols)
-
     print("Reading CSV with Polars …")
     df = pl.read_csv(path, **read_kwargs)
     try:
@@ -66,36 +50,41 @@ def load_csv_once(path: str, usecols=None) -> pl.DataFrame:
 def apply_missing_and_constant_drops(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict[str, str]]:
     dropped: Dict[str, str] = {}
     n = df.height
-    # Drop mostly-missing
+
+    # --- Missingness ---
     if DROP_MISSING_FRAC is not None and DROP_MISSING_FRAC > 0:
-        miss = df.null_count().row(0)  # dict-like of counts
+        miss = df.null_count().to_dicts()[0]  # {col -> null_count}
         to_drop = [c for c, cnt in miss.items() if n and (cnt / n) >= DROP_MISSING_FRAC]
         if to_drop:
             df = df.drop(to_drop)
-            for c in to_drop: dropped[c] = "mostly_missing"
+            for c in to_drop:
+                dropped[c] = "mostly_missing"
             print(f"Dropped {len(to_drop)} columns for missingness ≥ {DROP_MISSING_FRAC:.3f}")
 
-    # Drop near-constant (modal frequency)
+    # --- Near-constant by modal frequency among NON-NULLS ---
     if DROP_SINGLE_VALUE_FRAC is not None and DROP_SINGLE_VALUE_FRAC > 0:
-        const_drop = []
+        const_drop: list[str] = []
         for c in df.columns:
-            s_non_null = df.select(pl.col(c).drop_nulls())
-            if s_non_null.height == 0:
+            nn = df.select(pl.col(c).is_not_null().sum()).item()
+            if nn == 0:
                 continue
-            # top frequency
-            top_cnt = (
-                df.select(pl.col(c).value_counts(sort=True))
-                  .unnest(c)                             # -> columns: c, counts
-                  .select(pl.col("counts").first())
-                  .item()
+            vc = (
+                df.filter(pl.col(c).is_not_null())
+                  .group_by(c)
+                  .len()
+                  .sort("len", descending=True)
+                  .rename({"len": "count"})
             )
-            frac = top_cnt / s_non_null.height
-            if frac >= DROP_SINGLE_VALUE_FRAC:
+            top_cnt = vc.select(pl.col("count").first()).item()
+            if (top_cnt / nn) >= DROP_SINGLE_VALUE_FRAC:
                 const_drop.append(c)
+
         if const_drop:
             df = df.drop(const_drop)
-            for c in const_drop: dropped[c] = "near_constant"
+            for c in const_drop:
+                dropped[c] = "near_constant"
             print(f"Dropped {len(const_drop)} near-constant columns (modal freq ≥ {DROP_SINGLE_VALUE_FRAC:.3f})")
+
     return df, dropped
 
 def choose_int_dtype(min_val: int, max_val: int, unsigned_ok: bool) -> pl.DataType:
@@ -116,7 +105,6 @@ def downcast_numerics(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict[str, str]]:
     if not numeric_cols:
         return df, casts
 
-    # compute min/max for all numeric cols in one shot
     stats = df.select(
         *[pl.col(c).min().alias(f"{c}__min") for c in numeric_cols],
         *[pl.col(c).max().alias(f"{c}__max") for c in numeric_cols],
@@ -136,7 +124,6 @@ def downcast_numerics(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict[str, str]]:
                 exprs.append(pl.col(c).cast(target).alias(c))
                 casts[c] = str(target)
         elif pl.datatypes.is_float(dt):
-            # prefer Float32 for training
             if dt != pl.Float32:
                 exprs.append(pl.col(c).cast(pl.Float32).alias(c))
                 casts[c] = "Float32"
@@ -148,7 +135,6 @@ def normalize_booleanish_strings(df: pl.DataFrame) -> Tuple[pl.DataFrame, int]:
     changed = 0
     for c, dt in df.schema.items():
         if dt == pl.Utf8:
-            # If all non-null values are in {"true","false","0","1"} (case-insensitive), map to bool
             bad = df.filter(
                 pl.col(c).is_not_null()
                 & (~pl.col(c).str.to_lowercase().is_in(["true","false","0","1"]))
@@ -173,10 +159,9 @@ def handle_categoricals(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict[str, int]]
     High-card columns remain Utf8.
     """
     n = df.height
-    changed: Dict[str, int] = {}
-    cat_exprs = []
+    changes: Dict[str, int] = {}
+    cat_exprs: list[pl.Expr] = []
 
-    # Make category mapping consistent
     with pl.StringCache():
         for c, dt in df.schema.items():
             if dt != pl.Utf8:
@@ -186,22 +171,25 @@ def handle_categoricals(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict[str, int]]
             if nun == 0:
                 continue
             frac = nun / max(n, 1)
+
             if frac <= LOW_CARD_FRACTION:
-                # Determine which categories to keep (top-K & min count)
                 vc = (
-                    df.select(pl.col(c).value_counts(sort=True))
-                      .unnest(c)  # -> [c, counts]
+                    df.filter(pl.col(c).is_not_null())
+                      .group_by(c)
+                      .len()
+                      .sort("len", descending=True)
+                      .rename({"len": "count"})
                 )
                 kept = (
-                    vc.filter(pl.col("counts") >= RARE_MIN_COUNT)
+                    vc.filter(pl.col("count") >= RARE_MIN_COUNT)
                       .head(CAT_TOP_K)
-                      .select(pl.col(c))
-                      .to_series()
+                      .select(c)
+                      .get_column(c)
                       .to_list()
                 )
                 if not kept:
-                    # keep the single most common category if nothing passes thresholds
-                    kept = vc.select(pl.col(c)).head(1).to_series().to_list()
+                    top = vc.select(c).head(1).get_column(c).to_list()
+                    kept = top if top else []
 
                 if kept:
                     cat_exprs.append(
@@ -211,15 +199,11 @@ def handle_categoricals(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict[str, int]]
                           .cast(pl.Categorical)
                           .alias(c)
                     )
-                    changed[c] = nun
-            else:
-                # leave as Utf8
-                pass
-
+                    changes[c] = nun
         if cat_exprs:
             df = df.with_columns(cat_exprs).rechunk()
 
-    return df, changed
+    return df, changes
 
 def save_parquet(df: pl.DataFrame, path: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -233,13 +217,9 @@ def save_parquet(df: pl.DataFrame, path: str):
 
 def main():
     df = load_csv_once(CSV_PATH, USECOLS)
-
     df, dropped = apply_missing_and_constant_drops(df)
-
     df, bool_changes = normalize_booleanish_strings(df)
-
     df, num_casts = downcast_numerics(df)
-
     df, cats_changed = handle_categoricals(df)
 
     try:
@@ -256,7 +236,7 @@ def main():
 
     save_parquet(df, OUT_PARQUET)
 
-    # Example: training-friendly matrices (Polars -> one-hots)
+    # Example: one-hot for training (optional)
     # target = "charge_off_flag"
     # X = df.drop(target).to_dummies(drop_first=True).with_columns(pl.all().cast(pl.Float32))
     # y = df.get_column(target).cast(pl.Int8)
